@@ -47,6 +47,7 @@ const (
 	// Fixed names used in various resources managed by the operator.
 	NameOperator       = "gmp-operator"
 	nameRulesGenerated = "rules-generated"
+	nameRuleEvaluator  = "rule-evaluator"
 
 	// The official images to be used with this version of the operator. For debugging
 	// and emergency use cases they may be overwritten through options.
@@ -254,6 +255,9 @@ func (o *Operator) Run(ctx context.Context, ors ...metav1.OwnerReference) error 
 	}
 	if err := setupRulesControllers(o); err != nil {
 		return errors.Wrap(err, "setup rules controllers")
+	}
+	if err := setupRuleEvaluatorControllers(o); err != nil {
+		return errors.Wrap(err, "setup rule-evaluator controllers")
 	}
 
 	o.logger.Info("starting GMP operator")
