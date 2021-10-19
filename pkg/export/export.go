@@ -65,6 +65,10 @@ var (
 		Name: "gcm_export_shard_process_pending_total",
 		Help: "Number of shard retrievals with an empty result.",
 	})
+	gcmExportCalledWhileDisabled = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gcm_export_called_while_disabled_total",
+		Help: "Number of calls to export while metric exporting was disabled.",
+	})
 	shardProcessSamplesTaken = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "gcm_export_shard_process_samples_taken",
 		Help: "Number of samples taken when processing a shard.",
@@ -116,7 +120,9 @@ const (
 	// Time after an accumulating batch is flushed to GCM. This avoids data being
 	// held indefinititely if not enough new data flows in to fill up the batch.
 	batchDelayMax = 5 * time.Second
-
+	// Time after context is cancelled that we use to flush the remaining buffered data.
+	// This avoids data loss on shutdown.
+	cancelTimeout = 15 * time.Second
 	// Prefix for GCM metric.
 	metricTypePrefix = "prometheus.googleapis.com"
 )
@@ -342,9 +348,22 @@ func (e *Exporter) getExternalLabels() labels.Labels {
 	return e.externalLabels
 }
 
+func (e *Exporter) isDisabled() bool {
+	e.mtx.Lock()
+	defer e.mtx.Unlock()
+	return e.opts.Disable
+}
+
+func (e *Exporter) disable() {
+	e.mtx.Lock()
+	defer e.mtx.Unlock()
+	e.opts.Disable = true
+}
+
 // Export enqueues the samples to be written to Cloud Monitoring.
 func (e *Exporter) Export(metadata MetadataFunc, batch []record.RefSample) {
-	if e.opts.Disable {
+	if e.isDisabled() {
+		gcmExportCalledWhileDisabled.Inc()
 		return
 	}
 	for len(batch) > 0 {
@@ -384,7 +403,7 @@ const (
 )
 
 // Run sends exported samples to Google Cloud Monitoring.
-func (e *Exporter) Run(ctx context.Context) error {
+func (e *Exporter) Run(parentCtx context.Context) error {
 	clientOpts := []option.ClientOption{
 		option.WithGRPCDialOption(grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor)),
 	}
@@ -403,14 +422,16 @@ func (e *Exporter) Run(ctx context.Context) error {
 
 	// Identity User Agent for all gRPC requests.
 	clientOpts = append(clientOpts, option.WithUserAgent(ClientName+"/"+Version))
+	ctxLocal, cancelLocalCtx := context.WithCancel(context.Background())
+	defer cancelLocalCtx()
 
-	metricClient, err := monitoring.NewMetricClient(ctx, clientOpts...)
+	metricClient, err := monitoring.NewMetricClient(ctxLocal, clientOpts...)
 	if err != nil {
 		return err
 	}
 	defer metricClient.Close()
 
-	go e.seriesCache.run(ctx)
+	go e.seriesCache.run(ctxLocal)
 
 	timer := time.NewTimer(batchDelayMax)
 	stopTimer := func() {
@@ -454,7 +475,7 @@ func (e *Exporter) Run(ctx context.Context) error {
 
 	// Send the currently accumulated batch to GCM asynchronously.
 	send := func() {
-		go batch.send(ctx, pendingShards, metricClient.CreateTimeSeries)
+		go batch.send(ctxLocal, pendingShards, metricClient.CreateTimeSeries)
 
 		// Reset state for new batch.
 		stopTimer()
@@ -467,19 +488,12 @@ func (e *Exporter) Run(ctx context.Context) error {
 	// Starting index when iterating over shards. This ensures we don't always start at 0 so that
 	// some shards may never be sent in a busy collector.
 	shardOffset := 0
-
-	for {
+	drainShardsAttempt := func(drainCtx context.Context) bool {
 		select {
-		// NOTE(freinartz): we will terminate once context is cancelled and not flush remaining
-		// buffered data. In-flight requests will be aborted as well.
-		// This is fine once we persist data submitted via Export() but for now there may be some
-		// data loss on shutdown.
-		case <-ctx.Done():
-			return nil
-		// This is activated for each new sample that arrives
-		case <-e.nextc:
+		case <-drainCtx.Done():
+			return true
+		default:
 			sendIterations.Inc()
-
 			// Drain shards to fill up the batch.
 			//
 			// If the shard count is high given the overall throughput, a lot of shards may
@@ -489,21 +503,52 @@ func (e *Exporter) Run(ctx context.Context) error {
 			// adding a heuristic to send partial batches in favor of limiting the number of
 			// shards they span.
 			i := 0
+			drained := true
 			for ; i < len(e.shards); i++ {
 				shardOffset = (shardOffset + 1) % len(e.shards)
 				shard := e.shards[shardOffset]
 
 				if took := shard.fill(batch); took > 0 {
+					drained = false
 					pendingShards = append(pendingShards, shard)
 				}
 				if batch.full() {
 					send()
 				}
 			}
+			// TODO(macxamin): May not be needed. Remove in a future release.
 			// If we didn't make a full pass over all shards, there may be more work.
 			if i < len(e.shards) {
 				e.triggerNext()
 			}
+			return drained
+		}
+	}
+
+	for {
+		select {
+		case <-parentCtx.Done():
+			// On Termination:
+			// 1. stop the exporter from recieving new data.
+			// 2. Cancel ongoing drainShardsAttempt.
+			// 3. Try to drain the remaining shards within the CancelTimeout.
+			// This is done to prevent data loss during a shutdown.
+			e.disable()
+			cancelLocalCtx()
+			go func() {
+				drained := false
+				timeoutCtx, timeoutCancelCtx := context.WithTimeout(ctxLocal, cancelTimeout)
+				defer timeoutCancelCtx()
+
+				for !drained {
+					drained = drainShardsAttempt(timeoutCtx)
+				}
+			}()
+			return nil
+
+		// This is activated for each new sample that arrives
+		case <-e.nextc:
+			drainShardsAttempt(ctxLocal)
 
 		case <-timer.C:
 			// Flush batch that has been pending for too long.
