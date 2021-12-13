@@ -28,6 +28,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/GoogleCloudPlatform/prometheus-engine/pkg/export"
+	exportsetup "github.com/GoogleCloudPlatform/prometheus-engine/pkg/export/setup"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
@@ -68,10 +69,10 @@ func main() {
 		defaultProjectID, _ = metadata.ProjectID()
 	}
 
-	exporterOptions := export.NewFlagOptions(a)
+	newExporter := exportsetup.FromFlags(a)
 	notifierOptions := notifier.Options{}
 
-	projectID := a.Flag("query.project-id", "Project ID of the Google Cloud Monitoring workspace to evaluate rules against.").
+	projectID := a.Flag("query.project-id", "Project ID of the Google Cloud Monitoring scoping project to evaluate rules against.").
 		Default(defaultProjectID).String()
 
 	targetURL := a.Flag("query.target-url", fmt.Sprintf("The address of the Prometheus server query endpoint. (%s is replaced with the --query.project-id flag.)", projectIDVar)).
@@ -116,11 +117,12 @@ func main() {
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
 
-	destination, err := export.NewStorage(logger, reg, *exporterOptions)
+	exporter, err := newExporter(logger, reg)
 	if err != nil {
 		level.Error(logger).Log("msg", "Creating a Cloud Monitoring Exporter failed", "err", err)
 		os.Exit(1)
 	}
+	destination := export.NewStorage(exporter)
 
 	ctxRuleManger := context.Background()
 	ctxDiscover, cancelDiscover := context.WithCancel(context.Background())

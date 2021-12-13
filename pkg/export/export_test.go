@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
+	timestamp_pb "github.com/golang/protobuf/ptypes/timestamp"
 	gax "github.com/googleapis/gax-go/v2"
 	monitoredres_pb "google.golang.org/genproto/googleapis/api/monitoredres"
 	monitoring_pb "google.golang.org/genproto/googleapis/monitoring/v3"
