@@ -331,7 +331,16 @@ func (e *Exporter) Export(metadata MetadataFunc, batch []record.RefSample) {
 
 	e.mtx.Lock()
 	externalLabels := e.externalLabels
+	start, end, ok := e.opts.HighAvailabilityRange.Range()
 	e.mtx.Unlock()
+
+	if !ok {
+		// This will clear repeatedly while we don't hold the lease, which doesn't
+		// harm in any way.
+		e.seriesCache.clear()
+		prometheusSamplesDiscarded.WithLabelValues("no-ha-range").Inc()
+		return
+	}
 
 	builder := newSampleBuilder(e.seriesCache)
 	defer builder.close()
@@ -347,11 +356,27 @@ func (e *Exporter) Export(metadata MetadataFunc, batch []record.RefSample) {
 			continue
 		}
 		for _, s := range samples {
-			e.enqueue(s.hash, s.proto)
+			// Only enqueue samples for within our HA range.
+			if sampleInRange(s.proto, start, end) {
+				e.enqueue(s.hash, s.proto)
+			} else {
+				samplesDropped.WithLabelValues("not-in-ha-range").Inc()
+			}
 		}
 	}
 	// Signal that new data is available.
 	e.triggerNext()
+}
+
+func sampleInRange(sample *monitoring_pb.TimeSeries, start, end time.Time) bool {
+	// A sample has exactly one point in the time series. The start timestamp may be unset for gauges.
+	if s := sample.Points[0].Interval.StartTime; s != nil && s.AsTime().Before(start) {
+		return false
+	}
+	if sample.Points[0].Interval.EndTime.AsTime().After(end) {
+		return false
+	}
+	return true
 }
 
 func (e *Exporter) enqueue(hash uint64, sample *monitoring_pb.TimeSeries) {
